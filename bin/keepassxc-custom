@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+#
+# kc-sftp-agent — pull, open & push KeePassXC DB via SFTP using KeePassXC's agent
+# with a single GTK passphrase prompt reused for ssh-add and KeePassXC,
+# and remote‐mtime‐based change detection.
+
+# Load user-specific settings
+CONFIG="${HOME}/.config/keepassxc/keepassxc.ini"
+if [ ! -r "$CONFIG" ]; then
+    zenity --error --text="❌ Cannot find config. Copy keepassxc.ini.sample to keepassxc.ini and edit."
+    exit 1
+fi
+source "$CONFIG"
+
+# === Configuration ===
+SSH_KEY="$HOME/.ssh/your-ssh-key"
+REMOTE="user@host:/path/to/vault.kdbx"
+LOCAL="$HOME/.config/keepassxc/vault.kdbx"
+TEMP_REMOTE="$HOME/.config/keepassxc/vault.remote.kdbx"
+MAX_WAIT=5                         # seconds to wait for SSH_AUTH_SOCK
+KEY_LIFETIME=${KEY_LIFETIME:-3600} # seconds to keep SSH key in agent
+
+# Extract host and path
+REMOTE_HOST="${REMOTE%%:*}"
+REMOTE_PATH="${REMOTE#*:}"
+
+mkdir -p "$(dirname "$LOCAL")"
+zenity --notification --text="🔄 Starting KeePassXC SFTP sync"
+
+# 0) Safety checks
+if command -v lsof &>/dev/null && lsof "$LOCAL" &>/dev/null; then
+    zenity --error --text="⚠️ Vault file is already open! Close it first."
+    exit 1
+fi
+if pgrep -x keepassxc &>/dev/null; then
+    zenity --error --text="⚠️ KeePassXC is running! Close it first."
+    exit 1
+fi
+
+# 1) Prompt once for your passphrase
+PASSPHRASE=$(zenity --password \
+    --title="Unlock SSH Key & KeePassXC Vault" \
+    --text="Enter passphrase for your SSH key AND KeePassXC vault:")
+[ -z "$PASSPHRASE" ] && {
+    zenity --error --text="No passphrase entered, aborting."
+    exit 1
+}
+
+# 1a) Create a temporary SSH_ASKPASS helper that just echoes the passphrase
+ASKPASS_SCRIPT=$(mktemp)
+chmod 700 "$ASKPASS_SCRIPT"
+cat >"$ASKPASS_SCRIPT" <<EOF
+#!/usr/bin/env bash
+echo '$PASSPHRASE'
+EOF
+
+export SSH_ASKPASS="$ASKPASS_SCRIPT"
+export DISPLAY=:0
+
+# 1b) Load your SSH key into the agent, via GUI prompt (ssh-add will call SSH_ASKPASS)
+setsid ssh-add -t $KEY_LIFETIME "$SSH_KEY" </dev/null >/dev/null 2>&1
+rm -f "$ASKPASS_SCRIPT"
+
+# verify that it loaded
+if ! ssh-add -l | grep -q "$(basename "$SSH_KEY")"; then
+    zenity --error --text="❌ Failed to load SSH key into agent."
+    exit 1
+fi
+zenity --notification --text="✅ SSH key loaded"
+
+# 2) Wait for KeePassXC's agent socket
+zenity --notification --text="⏱️ Waiting for SSH agent socket"
+elapsed=0
+while [ -z "$SSH_AUTH_SOCK" ] || [ ! -S "$SSH_AUTH_SOCK" ]; do
+    sleep 1 && ((elapsed++))
+    if [ $elapsed -ge $MAX_WAIT ]; then
+        zenity --error --text="SSH agent socket not ready after $MAX_WAIT s."
+        exit 1
+    fi
+done
+zenity --notification --text="✅ SSH agent ready"
+
+# 3) Pull latest DB & record remote mtime
+zenity --notification --text="⬇️ Pulling latest vault"
+if ! scp "$REMOTE" "$LOCAL"; then
+    zenity --error --text="❌ Failed to pull vault"
+    exit 1
+fi
+REMOTE_MTIME1=$(ssh "$REMOTE_HOST" stat -c %Y "$REMOTE_PATH")
+zenity --notification --text="✅ Pulled vault (remote mtime: $REMOTE_MTIME1)"
+
+# 4) Auto-open KeePassXC using same passphrase
+zenity --notification --text="🔐 Opening vault in KeePassXC"
+echo "$PASSPHRASE" | keepassxc --pw-stdin "$LOCAL"
+
+# 5) Before pushing: check remote mtime again
+zenity --notification --text="🔍 Checking remote for changes"
+REMOTE_MTIME2=$(ssh "$REMOTE_HOST" stat -c %Y "$REMOTE_PATH")
+
+if [ "$REMOTE_MTIME1" -eq "$REMOTE_MTIME2" ]; then
+    # no change -> simple push
+    zenity --notification --text="⬆️ Pushing vault back"
+    if scp "$LOCAL" "$REMOTE"; then
+        zenity --notification --text="✅ Vault synced successfully"
+    else
+        zenity --error --text="❌ Failed to push vault back."
+    fi
+    exit 0
+fi
+
+# 6) Remote changed → merge
+zenity --warning --text="⚠️ Remote vault was updated at $REMOTE_MTIME2 → merging…"
+
+# Fetch updated remote
+if ! scp "$REMOTE" "$TEMP_REMOTE"; then
+    zenity --error --text="❌ Fetch for merge failed"
+    exit 1
+fi
+
+# Merge with same credentials (you'll be prompted once for your passphrase)
+if keepassxc-cli merge -s "$LOCAL" "$TEMP_REMOTE"; then
+    zenity --notification --text="🔄 Merged vaults successfully"
+else
+    zenity --error --text="❌ Merge failed, please merge manually"
+    exit 1
+fi
+
+# Push merged result
+zenity --notification --text="⬆️ Pushing merged vault back"
+if scp "$LOCAL" "$REMOTE"; then
+    zenity --notification --text="✅ Merged & synced"
+    rm -f "$TEMP_REMOTE"
+else
+    zenity --error --text="❌ Push of merged vault failed"
+    exit 1
+fi

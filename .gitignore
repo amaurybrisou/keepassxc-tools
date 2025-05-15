@@ -1,0 +1,11 @@
+# keep any .ini and bin scripts
+!keepassxc.ini
+!bin/
+
+# ignore database files
+*.kdbx
+
+# ignore any other binary cruft
+*.bak
+
+keepassxc.ini
