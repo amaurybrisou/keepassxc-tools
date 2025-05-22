@@ -80,57 +80,71 @@ while [ -z "$SSH_AUTH_SOCK" ] || [ ! -S "$SSH_AUTH_SOCK" ]; do
 done
 zenity --notification --text="✅ SSH agent ready"
 
-# 3) Pull latest DB & record remote mtime
-zenity --notification --text="⬇️ Pulling latest vault"
-if ! scp "$REMOTE" "$LOCAL"; then
-    zenity --error --text="❌ Failed to pull vault"
+# 3) Record initial remote & local modification times
+zenity --notification --text="🔍 Recording initial timestamps"
+REMOTE_MTIME1=$(ssh "$REMOTE_HOST" stat -c %Y "$REMOTE_PATH" 2>/dev/null) || {
+    zenity --error --text="❌ Failed to stat remote file"
     exit 1
-fi
-REMOTE_MTIME1=$(ssh "$REMOTE_HOST" stat -c %Y "$REMOTE_PATH")
-zenity --notification --text="✅ Pulled vault (remote mtime: $REMOTE_MTIME1)"
+}
+LOCAL_MTIME1=$(stat -c %Y "$LOCAL" 2>/dev/null || echo 0)
+zenity --notification --text="✅ Initial times — remote: $REMOTE_MTIME1, local: $LOCAL_MTIME1"
 
-# 4) Auto-open KeePassXC using same passphrase
+# 4) Open KeePassXC using same passphrase
 zenity --notification --text="🔐 Opening vault in KeePassXC"
 echo "$PASSPHRASE" | keepassxc --pw-stdin "$LOCAL"
 
-# 5) Before pushing: check remote mtime again
-zenity --notification --text="🔍 Checking remote for changes"
-REMOTE_MTIME2=$(ssh "$REMOTE_HOST" stat -c %Y "$REMOTE_PATH")
+# 5) After closing, re-check remote & local times
+zenity --notification --text="🔍 Re-checking timestamps"
+REMOTE_MTIME2=$(ssh "$REMOTE_HOST" stat -c %Y "$REMOTE_PATH" 2>/dev/null) || {
+    zenity --error --text="❌ Failed to re-stat remote file"
+    exit 1
+}
+LOCAL_MTIME2=$(stat -c %Y "$LOCAL")
 
-if [ "$REMOTE_MTIME1" -eq "$REMOTE_MTIME2" ]; then
-    # no change -> simple push
-    zenity --notification --text="⬆️ Pushing vault back"
-    if scp "$LOCAL" "$REMOTE"; then
-        zenity --notification --text="✅ Vault synced successfully"
+# 6) Decide what to do
+if [ "$REMOTE_MTIME2" -eq "$REMOTE_MTIME1" ]; then
+    # remote unchanged
+    if [ "$LOCAL_MTIME2" -le "$LOCAL_MTIME1" ]; then
+        # local unchanged too
+        zenity --notification --text="✅ No changes detected. Vault up-to-date."
+        exit 0
     else
-        zenity --error --text="❌ Failed to push vault back."
+        # you made changes → push
+        zenity --notification --text="⬆️ Pushing your changes"
+        if scp "$LOCAL" "$REMOTE"; then
+            zenity --notification --text="✅ Vault pushed successfully"
+            exit 0
+        else
+            zenity --error --text="❌ Failed to push vault"
+            exit 1
+        fi
     fi
-    exit 0
-fi
-
-# 6) Remote changed → merge
-zenity --warning --text="⚠️ Remote vault was updated at $REMOTE_MTIME2 → merging…"
-
-# Fetch updated remote
-if ! scp "$REMOTE" "$TEMP_REMOTE"; then
-    zenity --error --text="❌ Fetch for merge failed"
-    exit 1
-fi
-
-# Merge with same credentials (you'll be prompted once for your passphrase)
-if keepassxc-cli merge -s "$LOCAL" "$TEMP_REMOTE"; then
-    zenity --notification --text="🔄 Merged vaults successfully"
 else
-    zenity --error --text="❌ Merge failed, please merge manually"
-    exit 1
-fi
+    # remote changed underneath you → merge
+    zenity --warning --text="⚠️ Remote vault updated at $REMOTE_MTIME2 → merging…"
 
-# Push merged result
-zenity --notification --text="⬆️ Pushing merged vault back"
-if scp "$LOCAL" "$REMOTE"; then
-    zenity --notification --text="✅ Merged & synced"
-    rm -f "$TEMP_REMOTE"
-else
-    zenity --error --text="❌ Push of merged vault failed"
-    exit 1
+    # Fetch updated remote into TEMP_REMOTE
+    if ! scp "$REMOTE" "$TEMP_REMOTE"; then
+        zenity --error --text="❌ Failed to fetch remote for merge"
+        exit 1
+    fi
+
+    # Merge TEMP_REMOTE into your LOCAL copy
+    if keepassxc-cli merge -s "$LOCAL" "$TEMP_REMOTE"; then
+        zenity --notification --text="🔄 Merge succeeded"
+    else
+        zenity --error --text="❌ Merge failed – please resolve manually"
+        exit 1
+    fi
+
+    # Push merged result
+    zenity --notification --text="⬆️ Pushing merged vault back"
+    if scp "$LOCAL" "$REMOTE"; then
+        zenity --notification --text="✅ Merged & synced"
+        rm -f "$TEMP_REMOTE"
+        exit 0
+    else
+        zenity --error --text="❌ Push of merged vault failed"
+        exit 1
+    fi
 fi
